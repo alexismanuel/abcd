@@ -1,49 +1,104 @@
 # abcd — Agent Build Context Data
 
-## Specification
+## The Problem
 
-### Overview
+You're working with an agent. You need the right context at the right time — a meeting summary, a list of action items, a drafted email. Each piece depends on upstream data or other derived context. Today you:
 
-`abcd` is a declarative DAG runner for composing LLM calls into materialized artifacts. Developers define **sources** (raw inputs) and **contexts** (prompt templates referencing upstream artifacts). The system resolves execution order, caches what hasn't changed, and only recomputes what's needed.
+- Manually assemble prompts by copying artifacts between files
+- Re-derive everything when a source changes because nothing tracks dependencies
+- Have no record of what was produced, from what, or whether it's still current
+- Duplicate prompt patterns across projects because there's no reusable structure
 
-The CLI is designed for agent consumption first, with progressive disclosure for human readability.
+Context engineering is ad-hoc, manual, and fragile. You need a build system for it.
 
 ---
 
-### 1. Project Structure
+## What abcd Does
+
+`abcd` is a context build system. It models knowledge as a dependency graph of **sources** (raw data) and **contexts** (prompt templates that reference upstream artifacts). Given a context name, it:
+
+1. Resolves what upstream data is needed
+2. Assembles the fully hydrated prompt
+3. Invokes an executor to produce the artifact
+4. Tracks what was produced, when, and from what inputs
+
+It's Make for context. Make resolves C file dependencies and invokes gcc. abcd resolves context dependencies and invokes an agent. The agent does the reasoning — abcd does the plumbing.
+
+**Why abcd instead of nothing:**
+
+| Without abcd | With abcd |
+|---|---|
+| Manually copy-paste artifacts into prompts | `abcd build summary` — refs resolve automatically |
+| Re-derive everything on source changes | Content-addressed cache skips what's current |
+| No visibility into what depends on what | `abcd graph` shows the full DAG |
+| Prompt patterns live in chat history, not files | Contexts are versioned, composable, shareable |
+| No way to reproduce a context from a clean state | `abcd build --full-refresh` from any point |
+| Knowledge leaves with the person who built it | Shared contexts let the team invoke the same knowledge |
+| New team members have no idea what's available | `abcd list` — discover every invocable context instantly |
+
+---
+
+## Architecture
+
+### Primitives
+
+| Primitive | What |
+|---|---|
+| **Sources** | Declarative data dependencies. Described in English — what the data is, where to find it, how to fetch it. Not fetched by abcd. |
+| **Contexts** | Invocable units of knowledge. Prompt templates that reference upstream sources and contexts. The core product — composable, discoverable, shareable. |
+| **Manifest** | `target/manifest.json`. Tracks what's been produced, from what inputs, when. |
+
+### Two Modes
+
+**Standalone (build command):**
+```
+abcd build summary
+```
+abcd assembles the prompt, invokes the configured executor (default: `pi --print`), writes the result to `target/`, updates the manifest.
+
+**Agent-driven (assemble + put):**
+```
+abcd assemble summary --stdout    # agent gets the prompt
+# agent does its thing
+abcd put summary --in result.txt  # agent records the result
+```
+The agent handles execution. abcd handles graph resolution and state tracking.
+
+---
+
+### Project Structure
 
 ```
 my-project/
-├── abcd.yml                  # Project config
+├── abcd.yml
 ├── contexts/
 │   ├── extraction/
 │   │   ├── summary.md
 │   │   └── action_items.md
 │   └── generation/
-│       ├── email_draft.md
-│       └── slack_message.md
-├── target/                   # Materialized artifacts (gitignored)
+│       └── email_draft.md
+├── target/
 │   ├── manifest.json
 │   ├── extraction/
 │   │   ├── summary.md
 │   │   └── action_items.md
 │   └── generation/
-│       ├── email_draft.md
-│       └── slack_message.md
+│       └── email_draft.md
 └── .gitignore
 ```
 
-- `contexts/` contains markdown files, one per context. Arbitrary subdirectories allowed.
-- `target/` mirrors the `contexts/` directory structure.
-- Context names are flat and unique — derived from filename minus extension, regardless of subdirectory.
-- `target/` is gitignored. `target/manifest.json` tracks build state.
+- `contexts/` — prompt templates. One markdown file per context. Arbitrary subdirectories.
+- `target/` — materialized artifacts. Mirrors `contexts/`. Gitignored.
+- Context names: filename minus extension. Flat, unique across the project.
 
 ---
 
-### 2. Project Config — `abcd.yml`
+### Config — `abcd.yml`
 
 ```yaml
 name: my-project
+
+executor: pi --print
 
 defaults:
   model: openrouter/anthropic/claude-sonnet-4-20250514
@@ -52,250 +107,188 @@ defaults:
 
 vars:
   tone: "professional"
-  language: "english"
-
-providers:
-  file: abcd.providers.file.FileProvider
 
 sources:
   transcript:
-    provider: file
-    path: ./data/meeting.txt
-  tone:
-    provider: file
-    content: "professional and concise"
+    description: "Read the file at sources/transcript.md — the full meeting transcript from the product sync on 2026-05-05"
+  open_tickets:
+    description: "Query Jira project ATLAS for tickets with status 'In Progress'. Use Jira skills to fetch current ticket summaries, priorities, and assignees."
 ```
-
-**Fields:**
 
 | Field | Required | Description |
 |---|---|---|
-| `name` | Yes | Project name. Used for display and namespacing. |
-| `defaults` | No | Default model config. Contexts override per-field. |
-| `defaults.model` | No | Default LLM model string. |
-| `defaults.temperature` | No | Default temperature. |
-| `defaults.max_tokens` | No | Default max tokens. |
-| `vars` | No | Project-level variables. Accessible via `{{ var('key') }}`. |
-| `providers` | No | Provider registration. Key is provider name, value is Python import path. `file` provider is built-in. |
-| `sources` | No | Named source declarations. Each source references a provider and provider-specific config. |
+| `name` | Yes | Project name. |
+| `executor` | No | Command to invoke for `build`. Receives assembled prompt on stdin, artifact expected on stdout. Default: `pi --print`. |
+| `defaults` | No | Default model config. Passed to executor via env vars or arguments (executor-specific). |
+| `vars` | No | Project variables. Accessible via `{{ var('key') }}`. |
+| `sources` | No | Named source declarations. Each has a freeform `description` — English instructions for the agent on what data to fetch and how. abcd includes this description in assembled prompts. |
+
+Sources are not fetched by abcd. The description is a contract: it tells the executing agent what data is expected. The agent fetches using whatever tools or skills it has. This keeps abcd decoupled from the external world — no provider protocol, no API clients, no plugin system.
 
 ---
 
-### 3. Context Files
+### Context Files
 
-Each context is a markdown file with YAML frontmatter and a prompt body.
+Markdown with YAML frontmatter + prompt body.
 
 ```markdown
 ---
 model: openrouter/openai/gpt-4o
 temperature: 0.7
-system: "You are a helpful assistant that writes concise emails."
-description: "Generates a follow-up email from meeting summary and action items"
+system: "You extract structured information from meeting transcripts."
+description: "Extracts a summary from the meeting transcript"
 ---
 
-Write a follow-up email using the summary and action items.
+Extract a structured summary of the meeting.
 
-{{ ref('summary') }}
-
-{{ ref('action_items') }}
+{{ source('transcript') }}
 ```
-
-**Frontmatter fields:**
 
 | Field | Required | Description |
 |---|---|---|
-| `model` | No | LLM model string. Falls back to `abcd.yml` defaults. |
+| `description` | **Yes** | What this context produces. The public interface — shown in `list`, used by agents and humans to decide whether to invoke it. |
+| `model` | No | Model hint. Passed to executor. Falls back to defaults. |
+| `system` | No | System prompt. |
 | `temperature` | No | Sampling temperature. Falls back to defaults. |
 | `max_tokens` | No | Max output tokens. Falls back to defaults. |
-| `system` | No | System prompt sent as the system message. |
-| `description` | No | Human/agent-readable description. Used in `abcd list`. |
 
-Refs are **inferred** from the body — all `{{ ref('name') }}` and `{{ source('name') }}` calls are parsed at load time to build the DAG. No manual declaration needed.
-
-**Context naming:** Filename minus extension. Must be unique across the entire project. Loading fails on duplicates.
+Refs are **inferred** from the body. `{{ ref() }}` and `{{ source() }}` parsed at load time. No manual declaration.
 
 ---
 
-### 4. Template Engine
+### Template Engine
 
-Custom parser. Supports three functions:
+Three functions:
 
-| Function | Description |
+| Function | Expansion |
 |---|---|
-| `{{ ref('name') }}` | Injects the materialized content of an upstream context. |
-| `{{ source('name') }}` | Injects the content of a declared source. |
-| `{{ var('key') }}` | Injects a project-level variable from `abcd.yml`. |
+| `{{ ref('name') }}` | The produced artifact content from `target/`. Baked in — it's already been generated and versioned. |
+| `{{ source('name') }}` | The source description from config. Not the data itself — instructions for the agent to fetch it. |
+| `{{ var('key') }}` | The variable value from config. |
 
-**Structured injection:** Refs and sources are expanded into XML-tagged blocks at call time:
+Refs and sources expand differently:
 
-```
-Write a follow-up email using the summary and action items.
-
+**Ref (baked artifact):**
+```xml
 <ref name="summary">
-[materialized content of summary]
-</ref>
-
-<ref name="action_items">
-[materialized content of action_items]
+[full content of target/extraction/summary.md]
 </ref>
 ```
 
-The user writes `{{ ref('summary') }}` in their markdown. The tagged expansion is a rendering concern — the LLM receives structured input it can distinguish from instructions.
+**Source (fetch instruction):**
+```xml
+<source name="transcript">
+Read the file at sources/transcript.md — the full meeting transcript from the product sync on 2026-05-05
+</source>
+```
+
+This split is intentional. Sources are live data — their content may change between runs, and freshness is the agent's responsibility. Baking stale content into the prompt defeats the purpose. Refs are produced artifacts — they're deterministic, versioned in the manifest, and safe to include verbatim.
 
 ---
 
-### 5. Source Providers
+### DAG Resolution
 
-Sources are the entry points of the DAG — data not produced by `abcd`.
+1. Parse source declarations from `abcd.yml`.
+2. Scan `contexts/` — every markdown file is a context node.
+3. Parse template calls from each context body.
+4. Build directed graph: sources are leaves, contexts are internal nodes.
 
-**Provider protocol:**
+**Validation (fails before any operation):**
 
-```python
-from typing import Protocol
+- Cycles
+- Missing ref/source (with suggestion)
+- Duplicate context names
+- Source referenced in template but not declared in config
 
-class SourceProvider(Protocol):
-    async def fetch(self, config: dict) -> str: ...
-```
-
-- `config` is the source declaration from `abcd.yml` (everything under the source key except `provider`).
-- Returns the content as a string.
-
-**Built-in provider: `file`**
-
-Supports two config keys:
-
-```yaml
-sources:
-  transcript:
-    provider: file
-    path: ./data/meeting.txt      # file path
-
-  tone:
-    provider: file
-    content: "professional"        # inline string
-```
-
-**Third-party providers:**
-
-Registered in `abcd.yml` via Python import path:
-
-```yaml
-providers:
-  jira: my_abcd_jira.JiraProvider
-
-sources:
-  tickets:
-    provider: jira
-    project: ATLAS
-    status: In Progress
-```
-
-`abcd` does not ship providers for external services. It provides the harness — community builds and owns providers.
-
-**Determinism:** All source output is treated identically — content-hashed and compared. Providers may declare a `deterministic: bool` metadata field. When `false`, `abcd` warns the user that source output may vary between runs.
+**Execution:** Topological sort. Independent branches run concurrently.
 
 ---
 
-### 6. DAG Resolution
+### Caching
 
-**Building the graph:**
+Cache key per context: hash of prompt body + frontmatter config + upstream artifact hashes + source descriptions.
 
-1. Parse all context files in `contexts/` (recursive).
-2. Extract `{{ ref() }}` and `{{ source() }}` calls from each body.
-3. Build a directed graph: sources are leaf nodes, contexts are internal nodes.
-4. Edges: context → its refs/sources.
+Match → skip. Mismatch → re-execute. `put` always writes (explicit decision to record).
 
-**Validation (fails before any LLM call):**
-
-- Cycles detected → error with cycle path.
-- Missing ref/source → error with suggestion ("did you mean 'summary'?").
-- Duplicate context names → error with both file paths.
-
-**Execution order:** Topological sort. Independent branches run concurrently via `asyncio`.
-
----
-
-### 7. Caching
-
-**Cache key per context:** Hash of:
-
-- Prompt template body (markdown content)
-- Frontmatter config (model, temperature, max_tokens, system)
-- Content hashes of all upstream artifacts (both refs and sources)
-- Source provider configs
-
-**How it works:**
-
-1. On `abcd run`, compute current cache key for each context.
-2. Compare to cache key stored in `manifest.json`.
-3. If match → `cached`. Skip LLM call.
-4. If mismatch → re-materialize. Write new artifact and update manifest.
-
-**Manifest stores a `reason` field per context:**
+**Reasons:**
 
 | Reason | Meaning |
 |---|---|
-| `new` | Never materialized before |
-| `cached` | No upstream or config changes |
-| `upstream_changed: <name>` | Specific upstream artifact changed |
-| `prompt_changed` | Template body was edited |
-| `config_changed: <field>` | Frontmatter config field changed |
-| `forced` | `--full-refresh` flag |
+| `new` | Never produced |
+| `cached` | No changes detected |
+| `upstream_changed: <name>` | Upstream artifact or source changed |
+| `prompt_changed` | Template body edited |
+| `config_changed: <field>` | Frontmatter config changed |
+| `produced_externally` | Written via `put` |
+| `forced` | `--full-refresh` |
 
 ---
 
-### 8. LLM Integration
+### Manifest
 
-**Provider:** OpenRouter first (OpenAI-compatible API). `OPENROUTER_API_KEY` env var for auth.
+`target/manifest.json` — single source of truth for build state.
 
-**Model strings:** Passed directly to the API. E.g. `openrouter/anthropic/claude-sonnet-4-20250514`, `openrouter/openai/gpt-4o`.
-
-**Context size warning:** Before calling the LLM, estimate input token count (refs + source + prompt body + system prompt). Warn if estimated tokens approach or exceed the model's context window. Do not truncate. Still attempt the call — let the API return its own error if exceeded.
-
-**No streaming in v1.** Wait for full response, materialize, update manifest.
+Per context: cache key, content hash, reason, model used, timestamp, source (executor or external), upstream hashes.
 
 ---
 
-### 9. CLI
+## CLI
 
-Designed for agents first. Progressive disclosure.
+Agent-first. Progressive disclosure.
 
-**Output layers:**
+**Output modes:** default (rich TTY), `--verbose`, `--json`, `--quiet`.
+**Exit codes:** 0 success, 1 failure.
+**Default behavior:** commands write to `target/` and print the path. `--stdout` prints content.
 
-| Mode | When | Output |
-|---|---|---|
-| Default | TTY | Rich-formatted. Status dots, context names, pass/fail. |
-| `--verbose` | Flag | Timestamps, token estimates, model used per context, reason for (re)materialization. |
-| `--json` | Flag | Full structured JSON. All state machine-readable. |
-| `--quiet` | Flag | Suppress all stdout. Only exit code. |
-
-**Exit codes:**
-
-| Code | Meaning |
-|---|---|
-| 0 | All contexts materialized successfully |
-| 1 | One or more failures (fail-fast or final report with `--keep-going`) |
-
-**Commands:**
-
-#### `abcd init <name>`
-
-Create a new project with example context and `.gitignore`.
+### Core Commands
 
 ```
-$ abcd init my-project
-Created my-project/
-├── abcd.yml
-├── contexts/
-│   └── example.md
-└── .gitignore
+abcd assemble <context> [--stdout]
+```
+Hydrate all refs and sources. Write assembled prompt to `target/`. Print path (or content with `--stdout`). No execution.
+
+```
+abcd build <context>
+```
+Assemble + invoke executor + write result to `target/` + update manifest. This is the standard end-to-end command for standalone usage.
+
+```
+abcd put <context> --in <path>
+abcd put <context> --stdin
+```
+Record an externally-produced result. Validate it exists, write to `target/`, update manifest. Used in agent-driven workflows.
+
+```
+abcd status
+```
+Show what's current, what's stale, what's missing, and why. The starting point for any agent deciding what to produce.
+
+### Inspection Commands
+
+```
+abcd list
+```
+Discover available contexts. Name and description only — like listing skills. The entry point for anyone new to the project.
+
+```
+abcd show <context>
+```
+Full context metadata: description, frontmatter config, refs, sources, prompt body, materialization status. Like inspecting a skill. The detail view behind `list`.
+
+```
+abcd graph             # DAG as ASCII tree
+abcd validate          # Check graph without executing
 ```
 
-#### `abcd run [selectors...] [flags]`
+### Project Commands
 
-Run the DAG. Materialize all contexts or selected subset.
+```
+abcd init <name>       # Scaffold new project
+```
 
-**Selectors (dbt-style):**
+### Selectors (dbt-style)
+
+Available on `build`:
 
 | Selector | What runs |
 |---|---|
@@ -306,269 +299,44 @@ Run the DAG. Materialize all contexts or selected subset.
 | `2+summary` | summary + 2 levels upstream |
 | `summary+3` | summary + 3 levels downstream |
 
-Multiple selectors can be combined: `abcd run +email_draft +slack_message`
-
-**Flags:**
+### Flags
 
 | Flag | Description |
 |---|---|
-| `--select <selector>` | Alternative syntax for selectors |
-| `--full-refresh` | Ignore cache, rerun everything |
-| `--keep-going` | Continue on failure, skip dependents, report all errors at end |
-| `--project-dir <path>` | Project root directory (default: cwd) |
+| `--full-refresh` | Ignore cache |
+| `--keep-going` | Continue on failure |
+| `--project-dir <path>` | Project root (default: cwd) |
+| `--stdout` | Print content instead of path |
 | `--verbose` | Detailed output |
-| `--json` | Machine-readable JSON output |
+| `--json` | Machine-readable |
 | `--quiet` | Suppress stdout |
 
-**Default output (TTY):**
-
-```
-$ abcd run
-
-  source transcript    ✓ cached
-  summary              ● running... ✓ (3.2s)
-  action_items         ● running... ✓ (2.8s)
-  email_draft          ● running... ✓ (3.1s)
-
-  3 materialized, 1 cached, 0 errors (9.1s)
-```
-
-**`--json` output:**
-
-```json
-{
-  "project": "my-project",
-  "contexts": {
-    "summary": {
-      "status": "materialized",
-      "reason": "upstream_changed: transcript",
-      "duration_ms": 3200,
-      "model": "openrouter/anthropic/claude-sonnet-4-20250514",
-      "tokens_in": 1200,
-      "tokens_out": 450,
-      "hash": "sha256:abc123..."
-    },
-    "action_items": {
-      "status": "materialized",
-      "reason": "upstream_changed: summary",
-      "duration_ms": 2800,
-      "model": "openrouter/anthropic/claude-sonnet-4-20250514",
-      "tokens_in": 800,
-      "tokens_out": 200,
-      "hash": "sha256:def456..."
-    },
-    "email_draft": {
-      "status": "cached",
-      "reason": "cached",
-      "hash": "sha256:ghi789..."
-    }
-  },
-  "duration_ms": 9100,
-  "errors": []
-}
-```
-
-#### `abcd list`
-
-Show project inventory.
-
-```
-$ abcd list
-
-  Sources:
-    transcript (file)
-
-  Contexts:
-    summary          → [transcript]
-    action_items     → [summary]
-    email_draft      → [summary, action_items]
-    slack_message    → [summary]
-```
-
-`--json` returns full state:
-
-```json
-{
-  "sources": {
-    "transcript": {
-      "provider": "file",
-      "cached": true,
-      "hash": "sha256:..."
-    }
-  },
-  "contexts": {
-    "summary": {
-      "refs": ["transcript"],
-      "materialized": true,
-      "hash": "sha256:...",
-      "description": "Summarizes meeting transcript"
-    },
-    "email_draft": {
-      "refs": ["summary", "action_items"],
-      "materialized": false,
-      "description": "Generates a follow-up email"
-    }
-  }
-}
-```
-
-#### `abcd graph`
-
-Render the dependency DAG as an ASCII tree.
-
-```
-$ abcd graph
-
-transcript (source)
-├── summary
-│   ├── action_items
-│   │   └── email_draft
-│   └── email_draft
-└── slack_message
-```
-
-#### `abcd show <context>`
-
-Print materialized artifact content to stdout. Raw text, no formatting.
-
-```
-$ abcd show summary
-[outputs content of target/extraction/summary.md]
-```
-
-#### `abcd validate`
-
-Validate the DAG without running. Checks for cycles, missing refs, duplicate names.
-
 ---
 
-### 10. Manifest — `target/manifest.json`
-
-```json
-{
-  "project": "my-project",
-  "created_at": "2026-04-30T14:32:00Z",
-  "updated_at": "2026-04-30T14:32:10Z",
-  "contexts": {
-    "summary": {
-      "hash": "sha256:abc123...",
-      "cache_key": "sha256:def456...",
-      "reason": "upstream_changed: transcript",
-      "model": "openrouter/anthropic/claude-sonnet-4-20250514",
-      "materialized_at": "2026-04-30T14:32:04Z",
-      "upstream_hashes": {
-        "transcript": "sha256:src789..."
-      }
-    }
-  },
-  "sources": {
-    "transcript": {
-      "hash": "sha256:src789...",
-      "provider": "file",
-      "fetched_at": "2026-04-30T14:32:01Z"
-    }
-  }
-}
-```
-
----
-
-### 11. Parallelism
-
-Independent branches of the DAG run concurrently using `asyncio`. LLM API calls are IO-bound — no reason to wait sequentially when two contexts share no dependency relationship.
-
-A `--sequential` flag may be added for debugging.
-
----
-
-### 12. Error Handling
-
-**Default: fail fast.** First error stops the run. Already-materialized artifacts are kept.
-
-**`--keep-going`:** Continue running independent branches. Skip contexts whose upstream failed. Report all errors at the end.
-
-**DAG validation errors** (cycles, missing refs, duplicate names) always fail before any LLM call — regardless of flags.
-
----
-
-### 13. Authentication
-
-Single env var: `OPENROUTER_API_KEY`.
-
-No config file for secrets. No interactive prompts.
-
----
-
-### 14. Technical Stack
+## Implementation
 
 | Component | Choice |
 |---|---|
-| Language | Python 3.12+ |
-| Package manager | uv |
-| CLI framework | Click |
-| Terminal output | Rich |
-| LLM client | OpenAI SDK (OpenRouter-compatible) |
-| Config parsing | PyYAML |
-| Template engine | Custom parser (regex-based, ~20 lines) |
-| Async runtime | asyncio |
-
-**Dependencies:**
-
-- `click`
-- `rich`
-- `openai`
-- `pyyaml`
-
-Everything else is stdlib: `asyncio`, `hashlib`, `pathlib`, `json`, `re`, `fnmatch`.
+| Language | Go |
+| CLI | cobra |
+| Terminal | bubbletea + lipgloss |
+| Config | gopkg.in/yaml.v3 |
+| Concurrency | goroutines |
+| Executor | Subprocess invocation (configurable command) |
+| Distribution | Single binary |
 
 ---
 
-### 15. `abcd init` Template
+## Scope — What abcd Does NOT Do
 
-**`abcd.yml`:**
-
-```yaml
-name: ${PROJECT_NAME}
-
-defaults:
-  model: openrouter/anthropic/claude-sonnet-4-20250514
-  temperature: 0.3
-
-providers:
-  file: abcd.providers.file.FileProvider
-```
-
-**`contexts/example.md`:**
-
-```markdown
----
-description: "An example context — edit or replace me"
-system: "You are a helpful assistant."
----
-
-Summarize the following text concisely.
-
-{{ source('input') }}
-```
-
-**`.gitignore`:**
-
-```
-target/
-```
-
----
-
-### 16. Scope — What abcd Does NOT Do
-
-- No knowledge graph
+- No LLM client — execution is delegated to the configured executor
+- No provider protocol — sources are described in English, fetched by agents
+- No agent orchestration — abcd never calls an agent (it calls an executor)
+- No actions on the world — abcd produces text artifacts
 - No vector retrieval / RAG
-- No schema inference or output validation
-- No auto-suggested refs
 - No streaming output
-- No built-in providers for external services (only `file`)
-- No pure transformations (every context calls an LLM)
 - No interactive prompts or TUI
-- No sub-agents or agent orchestration
-
-abcd is a deterministic build system for LLM context. DAG resolution, content-addressed caching, selective execution. That's the product.
+- No scheduling or proactive triggers
+- No multi-user, permissions, or governance
+- No schema validation or structured output in v1
+- No prompt optimization
