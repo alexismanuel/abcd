@@ -9,30 +9,28 @@ You're working with an agent. You need the right context at the right time — a
 - Have no record of what was produced, from what, or whether it's still current
 - Duplicate prompt patterns across projects because there's no reusable structure
 
-Context engineering is ad-hoc, manual, and fragile. You need a build system for it.
+Context engineering is ad-hoc, manual, and fragile. You need a runtime for it.
 
 ---
 
 ## What abcd Does
 
-`abcd` is a context build system. It models knowledge as a dependency graph of **sources** (raw data) and **contexts** (prompt templates that reference upstream artifacts). Given a context name, it:
+abcd is the runtime for contexts. It models knowledge as a dependency graph of **sources** (data specs) and **contexts** (prompt templates that reference upstream artifacts). Given a context name, it:
 
 1. Resolves what upstream data is needed
-2. Assembles the fully hydrated prompt
+2. Binds all references to their values, producing a self-contained prompt
 3. Invokes an executor to produce the artifact
-4. Tracks what was produced, when, and from what inputs
-
-It's Make for context. Make resolves C file dependencies and invokes gcc. abcd resolves context dependencies and invokes an agent. The agent does the reasoning — abcd does the plumbing.
+4. Tracks freshness — what was produced, when, and whether it's still valid
 
 **Why abcd instead of nothing:**
 
 | Without abcd | With abcd |
 |---|---|
-| Manually copy-paste artifacts into prompts | `abcd build summary` — refs resolve automatically |
-| Re-derive everything on source changes | Content-addressed cache skips what's current |
+| Manually copy-paste artifacts into prompts | `abcd run summary` — refs resolve automatically |
+| Re-derive everything on source changes | Freshness tracking skips what's still valid |
 | No visibility into what depends on what | `abcd graph` shows the full DAG |
 | Prompt patterns live in chat history, not files | Contexts are versioned, composable, shareable |
-| No way to reproduce a context from a clean state | `abcd build --full-refresh` from any point |
+| No way to reproduce a context from a clean state | `abcd run --full-refresh` from any point |
 | Knowledge leaves with the person who built it | Shared contexts let the team invoke the same knowledge |
 | New team members have no idea what's available | `abcd list` — discover every invocable context instantly |
 
@@ -44,25 +42,31 @@ It's Make for context. Make resolves C file dependencies and invokes gcc. abcd r
 
 | Primitive | What |
 |---|---|
-| **Sources** | Declarative data dependencies. Described in English — what the data is, where to find it, how to fetch it. Not fetched by abcd. |
-| **Contexts** | Invocable units of knowledge. Prompt templates that reference upstream sources and contexts. The core product — composable, discoverable, shareable. |
-| **Manifest** | `target/manifest.json`. Tracks what's been produced, from what inputs, when. |
+| **Sources** | Data specs — described in natural language, not fetched by abcd. The executor fulfills them. |
+| **Contexts** | Prompt templates that reference upstream sources and contexts. Composable, discoverable, shareable. |
+| **Manifest** | `target/manifest.json`. The state ledger — tracks freshness, not history. |
 
 ### Two Modes
 
-**Standalone (build command):**
+**Standalone (for production orchestrators):**
 ```
-abcd build summary
+abcd run summary
 ```
-abcd assembles the prompt, invokes the configured executor (default: `pi --print`), writes the result to `target/`, updates the manifest.
+abcd resolves the DAG, checks freshness, binds each context, invokes the configured executor subprocess (stdin → stdout), writes artifacts, updates manifest. Designed for schedulers like Dagster or Airflow calling abcd as a step in a pipeline.
 
-**Agent-driven (assemble + put):**
+**Agent-driven (for AI agents):**
 ```
-abcd assemble summary --stdout    # agent gets the prompt
+abcd bind summary --stdout    # agent gets the bound prompt
 # agent does its thing
-abcd put summary --in result.txt  # agent records the result
+abcd run summary --input result.txt  # abcd records the result
 ```
-The agent handles execution. abcd handles graph resolution and state tracking.
+abcd still resolves the DAG and checks freshness. The agent is the executor — it receives bound prompts, produces artifacts, hands them back. The caller agent asks for a target context and receives the final artifact. It never sees the chain.
+
+In both modes, abcd owns the DAG. The executor (subprocess or agent) owns execution.
+
+### The Seam
+
+abcd knows **what** and **when** — what dependencies exist, what order to resolve them, what's stale. The executor knows **how** — how to fetch from Jira, how to call GitHub, how to reason. The executor receives a bound prompt containing all source specs and ref content. It doesn't know the DAG, just executes what it's given.
 
 ---
 
@@ -89,7 +93,7 @@ my-project/
 
 - `contexts/` — prompt templates. One markdown file per context. Arbitrary subdirectories.
 - `target/` — materialized artifacts. Mirrors `contexts/`. Gitignored.
-- Context names: filename minus extension. Flat, unique across the project.
+- Context names: filename minus extension. Unique across the project.
 
 ---
 
@@ -105,9 +109,6 @@ defaults:
   temperature: 0.3
   max_tokens: 4096
 
-vars:
-  tone: "professional"
-
 sources:
   transcript:
     description: "Read the file at sources/transcript.md — the full meeting transcript from the product sync on 2026-05-05"
@@ -118,12 +119,9 @@ sources:
 | Field | Required | Description |
 |---|---|---|
 | `name` | Yes | Project name. |
-| `executor` | No | Command to invoke for `build`. Receives assembled prompt on stdin, artifact expected on stdout. Default: `pi --print`. |
-| `defaults` | No | Default model config. Passed to executor via env vars or arguments (executor-specific). |
-| `vars` | No | Project variables. Accessible via `{{ var('key') }}`. |
-| `sources` | No | Named source declarations. Each has a freeform `description` — English instructions for the agent on what data to fetch and how. abcd includes this description in assembled prompts. |
-
-Sources are not fetched by abcd. The description is a contract: it tells the executing agent what data is expected. The agent fetches using whatever tools or skills it has. This keeps abcd decoupled from the external world — no provider protocol, no API clients, no plugin system.
+| `executor` | No | Command to invoke in standalone mode. Receives bound prompt on stdin, artifact expected on stdout. Default: `pi --print`. |
+| `defaults` | No | Default executor config (model, temperature, max_tokens). Passed to executor via env vars or arguments (executor-specific). Only used in standalone mode — in agent-driven mode, the agent decides. |
+| `sources` | No | Named source specs. Each has a freeform `description` — a spec that tells the executor what data is expected. |
 
 ---
 
@@ -133,56 +131,63 @@ Markdown with YAML frontmatter + prompt body.
 
 ```markdown
 ---
-model: openrouter/openai/gpt-4o
-temperature: 0.7
-system: "You extract structured information from meeting transcripts."
 description: "Extracts a summary from the meeting transcript"
+expect: json
 ---
 
 Extract a structured summary of the meeting.
 
-{{ source('transcript') }}
+<source name="transcript" />
 ```
 
 | Field | Required | Description |
 |---|---|---|
 | `description` | **Yes** | What this context produces. The public interface — shown in `list`, used by agents and humans to decide whether to invoke it. |
-| `model` | No | Model hint. Passed to executor. Falls back to defaults. |
-| `system` | No | System prompt. |
-| `temperature` | No | Sampling temperature. Falls back to defaults. |
-| `max_tokens` | No | Max output tokens. Falls back to defaults. |
+| `expect` | No | Structural acceptance check. `non-empty` or `json`. Fails the run if output doesn't match. Default: no expectations. |
 
-Refs are **inferred** from the body. `{{ ref() }}` and `{{ source() }}` parsed at load time. No manual declaration.
+Dependencies are **inferred** from the body. `<ref name="..." />` and `<source name="..." />` are parsed at load time. No manual declaration.
+
+Frontmatter is intentionally thin — only context-level concerns. Model, temperature, max_tokens, and system prompt belong to the executor, not the context.
 
 ---
 
-### Template Engine
+### Template Syntax
 
-Three functions:
+Two tags:
 
-| Function | Expansion |
+| Tag | Expansion |
 |---|---|
-| `{{ ref('name') }}` | The produced artifact content from `target/`. Baked in — it's already been generated and versioned. |
-| `{{ source('name') }}` | The source description from config. Not the data itself — instructions for the agent to fetch it. |
-| `{{ var('key') }}` | The variable value from config. |
+| `<ref name="..." />` | The produced artifact content from `target/`. Baked in — it's already been generated and accepted. |
+| `<source name="..." />` | The source spec from config. Not the data itself — instructions for the executor to fulfill. |
 
-Refs and sources expand differently:
+Input is a self-closing tag; expansion wraps the content:
 
 **Ref (baked artifact):**
 ```xml
+<!-- input -->
+<ref name="summary" />
+
+<!-- expanded output -->
 <ref name="summary">
 [full content of target/extraction/summary.md]
 </ref>
 ```
 
-**Source (fetch instruction):**
+**Source (spec):**
 ```xml
+<!-- input -->
+<source name="transcript" />
+
+<!-- expanded output -->
 <source name="transcript">
 Read the file at sources/transcript.md — the full meeting transcript from the product sync on 2026-05-05
 </source>
 ```
 
-This split is intentional. Sources are live data — their content may change between runs, and freshness is the agent's responsibility. Baking stale content into the prompt defeats the purpose. Refs are produced artifacts — they're deterministic, versioned in the manifest, and safe to include verbatim.
+Sources and refs are fundamentally different:
+
+- **Refs** are baked from materialized artifacts. Deterministic, tracked for freshness. An artifact changes → downstream refs are stale.
+- **Sources** are specs. The executor fulfills them fresh at every execution. Always live by structure — abcd never holds source data, only the spec.
 
 ---
 
@@ -190,7 +195,7 @@ This split is intentional. Sources are live data — their content may change be
 
 1. Parse source declarations from `abcd.yml`.
 2. Scan `contexts/` — every markdown file is a context node.
-3. Parse template calls from each context body.
+3. Parse `<ref />` and `<source />` tags from each context body.
 4. Build directed graph: sources are leaves, contexts are internal nodes.
 
 **Validation (fails before any operation):**
@@ -204,31 +209,44 @@ This split is intentional. Sources are live data — their content may change be
 
 ---
 
-### Caching
+### Freshness
 
-Cache key per context: hash of prompt body + frontmatter config + upstream artifact hashes + source descriptions.
+An artifact is **fresh** when nothing that affects its output has changed since it was last accepted. Freshness is tracked per-context via content hashes stored in the manifest.
 
-Match → skip. Mismatch → re-execute. `put` always writes (explicit decision to record).
-
-**Reasons:**
+**Invalidation reasons:**
 
 | Reason | Meaning |
 |---|---|
 | `new` | Never produced |
-| `cached` | No changes detected |
-| `upstream_changed: <name>` | Upstream artifact or source changed |
-| `prompt_changed` | Template body edited |
-| `config_changed: <field>` | Frontmatter config changed |
-| `produced_externally` | Written via `put` |
+| `upstream_changed: <name>` | An upstream artifact or source spec changed |
+| `prompt_changed` | Context prompt body was edited |
+| `config_changed` | Context frontmatter changed |
 | `forced` | `--full-refresh` |
+
+Freshness is not a cache. It's a record of accepted decisions — the artifact was produced, accepted, and nothing has invalidated it since. `--full-refresh` overrides freshness and forces re-execution.
+
+Sources are excluded from freshness tracking because they are always live — the executor fulfills them fresh at every run.
+
+---
+
+### Acceptance
+
+A context can optionally declare structural expectations on its output via `expect` in frontmatter:
+
+- `non-empty` — artifact must contain content
+- `json` — artifact must be valid JSON
+
+If the produced artifact doesn't match, the run fails for that context. No semantic validation — the executor decides if the output is *good*, abcd only checks if it's *shaped right*. Default: no expectations.
 
 ---
 
 ### Manifest
 
-`target/manifest.json` — single source of truth for build state.
+`target/manifest.json` — the state ledger.
 
-Per context: cache key, content hash, reason, model used, timestamp, source (executor or external), upstream hashes.
+Per context: content hash, input hashes, context definition hash, timestamp, executor used, freshness reason.
+
+Not a cache. No history. Current state only. Versioning is git's job.
 
 ---
 
@@ -243,40 +261,40 @@ Agent-first. Progressive disclosure.
 ### Core Commands
 
 ```
-abcd assemble <context> [--stdout]
+abcd bind <context> [--stdout]
 ```
-Hydrate all refs and sources. Write assembled prompt to `target/`. Print path (or content with `--stdout`). No execution.
+Resolve all refs and sources. Write bound prompt to `target/`. Print path (or content with `--stdout`). No execution.
 
 ```
-abcd build <context>
+abcd run <context>
 ```
-Assemble + invoke executor + write result to `target/` + update manifest. This is the standard end-to-end command for standalone usage.
+Bind + execute + materialize. Resolves the DAG, checks freshness for the target and all upstream contexts, executes stale contexts in order, writes artifacts, updates manifest. This is the standard end-to-end command.
 
 ```
-abcd put <context> --in <path>
-abcd put <context> --stdin
+abcd run <context> --input <path>
+abcd run <context> --stdin
 ```
-Record an externally-produced result. Validate it exists, write to `target/`, update manifest. Used in agent-driven workflows.
+Record an externally-produced artifact. Used in agent-driven mode: the agent executes the bound prompt and records the result via this command. Validates against `expect` if declared, writes to `target/`, updates manifest.
 
 ```
-abcd status
+abcd status <context>
 ```
-Show what's current, what's stale, what's missing, and why. The starting point for any agent deciding what to produce.
+Show freshness for a given context: current state, whether stale, why, what upstream changed.
 
 ### Inspection Commands
 
 ```
 abcd list
 ```
-Discover available contexts. Name and description only — like listing skills. The entry point for anyone new to the project.
+Discover available contexts. Name and description only — like listing skills.
 
 ```
 abcd show <context>
 ```
-Full context metadata: description, frontmatter config, refs, sources, prompt body, materialization status. Like inspecting a skill. The detail view behind `list`.
+Full context metadata: description, frontmatter config, refs, sources, prompt body, materialization status.
 
 ```
-abcd graph             # DAG as ASCII tree
+abcd graph             # DAG as tree
 abcd validate          # Check graph without executing
 ```
 
@@ -286,9 +304,9 @@ abcd validate          # Check graph without executing
 abcd init <name>       # Scaffold new project
 ```
 
-### Selectors (dbt-style)
+### Selectors
 
-Available on `build`:
+Available on `run`:
 
 | Selector | What runs |
 |---|---|
@@ -303,7 +321,7 @@ Available on `build`:
 
 | Flag | Description |
 |---|---|
-| `--full-refresh` | Ignore cache |
+| `--full-refresh` | Ignore freshness, rerun everything |
 | `--keep-going` | Continue on failure |
 | `--project-dir <path>` | Project root (default: cwd) |
 | `--stdout` | Print content instead of path |
@@ -317,21 +335,21 @@ Available on `build`:
 
 | Component | Choice |
 |---|---|
-| Language | Go |
-| CLI | cobra |
-| Terminal | bubbletea + lipgloss |
-| Config | gopkg.in/yaml.v3 |
-| Concurrency | goroutines |
+| Language | Python |
+| CLI | typer or click |
+| Terminal | rich |
+| Config | PyYAML |
+| Concurrency | asyncio |
 | Executor | Subprocess invocation (configurable command) |
-| Distribution | Single binary |
+| Distribution | pip / uv tool |
 
 ---
 
 ## Scope — What abcd Does NOT Do
 
-- No LLM client — execution is delegated to the configured executor
-- No provider protocol — sources are described in English, fetched by agents
-- No agent orchestration — abcd never calls an agent (it calls an executor)
+- No LLM client — execution is delegated to the configured executor or agent
+- No provider protocol — sources are specs, fulfilled by the executor
+- No agent orchestration — abcd owns the DAG, the executor owns reasoning
 - No actions on the world — abcd produces text artifacts
 - No vector retrieval / RAG
 - No streaming output
@@ -340,3 +358,10 @@ Available on `build`:
 - No multi-user, permissions, or governance
 - No schema validation or structured output in v1
 - No prompt optimization
+- No cost tracking in v1
+
+---
+
+## Skill
+
+abcd ships with an agent skill that teaches agents how to author contexts well. Beyond syntax, it guides agents to behave like domain experts: asking clarifying questions, defining terms, aligning on language, challenging assumptions before writing prompts. The discipline of building shared understanding before building context.
