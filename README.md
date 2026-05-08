@@ -1,87 +1,98 @@
 # abcd
 
-**Agent Build Context Data** — dbt for context engineering.
+**Agent Build Context Data** — the runtime for contexts.
 
-You compose LLM calls into a DAG. Each model references upstream outputs, runs a prompt, and materializes an artifact. The system resolves execution order, caches what hasn't changed, and only recomputes what's needed.
+Contexts are prompt templates that declare dependencies on data sources and each other. abcd resolves the dependency graph, binds references to their values, and materializes artifacts. Only reruns what's stale.
 
-## Why
+## Quick start
 
-Everyone hand-wires multi-step LLM calls in scripts. No hashing, no caching, no reuse. Every run is from scratch. `abcd` treats prompt chains like a build system: declarative models, content-addressed caching, selective execution.
-
-## How it works
-
-Define sources and models in YAML:
+Define sources and contexts:
 
 ```yaml
+# abcd.yml
+name: my-project
+
 sources:
-  transcript: ./meeting.txt
-
-models:
-  summary:
-    prompt: "Summarize: {{ ref('transcript') }}"
-
-  action_items:
-    prompt: "Extract action items from: {{ ref('summary') }}"
-
-  email_draft:
-    prompt: "Write a follow-up email using {{ ref('summary') }} and {{ ref('action_items') }}"
+  transcript:
+    description: "The full meeting transcript from the product sync on 2026-05-05"
+  open_tickets:
+    description: "Query Jira project ATLAS for tickets with status 'In Progress'"
 ```
 
-Run the DAG:
+```markdown
+<!-- contexts/extraction/summary.md -->
+---
+description: "Extracts a summary from the meeting transcript"
+---
+
+Extract a structured summary of the meeting.
+
+<source name="transcript" />
+```
+
+```markdown
+<!-- contexts/extraction/action_items.md -->
+---
+description: "Extracts action items from the meeting transcript and summary"
+expect: json
+---
+
+Extract action items.
+
+<source name="transcript" />
+<ref name="summary" />
+```
+
+```markdown
+<!-- contexts/generation/email_draft.md -->
+---
+description: "Writes a follow-up email from the summary and action items"
+---
+
+Write a follow-up email.
+
+<ref name="summary" />
+<ref name="action_items" />
+```
+
+Run:
 
 ```
-$ abcd run
+$ abcd run email_draft
 
-  transcript    ✓ cached
-  summary       ● running... ✓ materialized
-  action_items  ● running... ✓ materialized
-  email_draft   ● running... ✓ materialized
-```
-
-Only rerun what changed:
-
-```
-$ abcd run --select email_draft
-
-  transcript    ✓ cached
-  summary       ✓ cached
-  action_items  ✓ cached
-  email_draft   ● running... ✓ materialized
+  transcript      ● spec injected
+  summary         ● bound → running... ✓ fresh
+  action_items    ● bound → running... ✓ fresh
+  email_draft     ● bound → running... ✓ fresh
 ```
 
 ## Concepts
 
 | Concept | What it is |
 |---|---|
-| **Source** | Raw input — a file, text, API response. Declared, not produced by the system. |
-| **Model** | A prompt template + references to upstream artifacts. Running a model calls an LLM and materializes the output. |
-| **Ref** | `{{ ref('name') }}` injects the materialized content of another artifact. Makes the DAG explicit. |
-| **Artifact** | The materialized output of a model. Text or JSON on disk. Diffable, version-controllable. |
-| **Cache** | Content-hashed. A model reruns only when its prompt or any upstream artifact changes. |
-
-## Core features
-
-- **Declarative models.** YAML + `{{ ref() }}` replaces ad-hoc prompt chaining scripts.
-- **DAG resolution.** Define models, the system figures out execution order.
-- **Content-hashed caching.** Change a source? Only downstream models rerun.
-- **Selective execution.** `--select` runs only what's needed to produce a target artifact.
-- **Plain artifacts.** Output is text/JSON on disk. Composable, diffable, version-controllable.
-
-## What it doesn't do
-
-No knowledge graph. No vector retrieval. No schema inference. No auto-suggested refs. Just a deterministic build system for LLM context.
+| **Context** | A prompt template with dependencies. The primary unit of work. |
+| **Source** | A spec — describes expected data, not the data itself. Fulfilled by the executor at runtime. |
+| **Ref** | `<ref name="..." />` — injects the materialized artifact of another context. Makes the DAG explicit. |
+| **Artifact** | The output of a context. Text or JSON on disk. |
+| **Freshness** | Tracks whether an artifact is still valid. Stale when inputs or context definition changed. |
 
 ## CLI
 
 ```
-abcd run                    Run all models in dependency order
-abcd run --select <model>   Run only what's needed to produce target
-abcd run --full-refresh     Ignore cache, rerun everything
-abcd list                   List all sources and models
-abcd show <model>           Display a model's materialized artifact
-abcd graph                  Print the dependency graph
+abcd run <context>              Bind + execute + materialize
+abcd run <context> --input ...  Record externally-produced artifact (agent-driven)
+abcd bind <context>             Resolve references, produce bound prompt
+abcd status <context>           Show freshness: current state, why stale, what changed
+abcd list                       List all contexts
+abcd show <context>             Context metadata and current artifact
+abcd graph                      Print the dependency graph
+abcd validate                   Check graph without executing
+abcd init <name>                Scaffold new project
 ```
 
-## Status
+## Docs
 
-Early concept. See [SPEC.md](docs/SPEC.md) for detailed design.
+- [CONTEXT.md](docs/CONTEXT.md) — domain language, glossary, and decisions
+- [SPEC.md](docs/SPEC.md) — detailed design specification
+- [ADR-0001](docs/adr/0001-python-over-go.md) — Python over Go
+- [ADR-0002](docs/adr/0002-xml-tags-over-jinja.md) — XML tags over Jinja
